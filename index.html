@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Himadri · Process Station (HMI)</title>
+<!--
+  PROJECT HIMADRI - Bio-Aware Thermal Cold Storage | SIH 2026 (SIH26005)
+  PROCESS STATION / DAQ HMI  (single file, no external libraries, works offline)
+
+  Looks and behaves like a small SCADA screen:
+    1. Process mimic  - solar -> compressor -> glycol PCM wall -> 4 zones with dampers
+    2. Instrument tag list - PV, engineering unit, scaled 4-20 mA, alarm limits
+    3. Multi-pen trend (historian window)
+    4. ISA-18.2 style alarm summary with acknowledge (ACTIVE / ACK / RTN)
+    5. Event log
+
+  DATA SOURCE
+    Default : built-in process simulator (1 s scan) so it runs anywhere.
+    Live    : open index.html?api=http://<esp32-ip>/data.json  and serve JSON like
+              {"values":{"TT-201":5.4,"MT-201":88,"AT-201":640,"SC-301":42,"ST-301":1260, ...
+                         "TT-101":-1.2,"EI-101":15.3,"JT-301":1.9},
+               "dampers":{"A":false,"B":false,"C":true,"D":false}, "comp":true,
+               "energyWh":0.84, "baselineWh":2.10}
+
+  FAN CONTROL (mirrors firmware): per-zone PI on temperature (setpoint 6 C) + humidity trim,
+  25 % floor, night cap 50 %, slew-rate limit, 100 % override while the damper is open.
+  Fan power ~ speed^3, so the HMI compares measured energy with a fixed-100 % baseline.
+-->
+<style>
+:root{
+  --bg:#080d15; --panel:#0f1622; --panel2:#0b111b; --line:#1f2d45; --txt:#d7e0ee; --dim:#7b8aa3;
+  --ok:#22c55e; --warn:#f59e0b; --crit:#ef4444; --cyan:#38bdf8; --blue:#3b82f6;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.35 system-ui,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;padding:10px 16px;background:#0a1220;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0;letter-spacing:.06em}
+header h1 small{display:block;font-weight:400;color:var(--dim);letter-spacing:0;font-size:11px}
+.chip{font:12px var(--mono);padding:4px 9px;border:1px solid var(--line);border-radius:4px;background:var(--panel)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:6px}
+.dot.bad{background:var(--crit)}
+.spacer{flex:1}
+.cnt-crit{color:var(--crit);border-color:#5b1d1d}
+.cnt-warn{color:var(--warn);border-color:#5b4310}
+main{display:grid;grid-template-columns:1.5fr 1fr;gap:12px;padding:12px 16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;min-width:0}
+.card h2{margin:0 0 8px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);display:flex;align-items:center;gap:8px}
+.card h2 .r{margin-left:auto;display:flex;gap:6px}
+.full{grid-column:1/-1}
+button,select{background:#14213a;color:var(--txt);border:1px solid #2a3d63;border-radius:4px;padding:4px 10px;font:12px var(--mono);cursor:pointer}
+button:hover{background:#1b2d50}
+button.on{background:#3b1d1d;border-color:#7f2a2a}
+button.tab.sel{background:#1e3a6b;border-color:var(--cyan)}
+/* ---------- mimic ---------- */
+svg#mimic{width:100%;height:auto;display:block;background:var(--panel2);border-radius:6px}
+svg text{font-family:var(--mono)}
+.lbl{fill:var(--dim);font-size:11px}
+.val{fill:var(--txt);font-size:15px;font-weight:700}
+.big{fill:var(--cyan);font-size:16px;font-weight:700}
+.pipe{stroke:#3a4d70;stroke-width:4;fill:none}
+.pipe.flow{stroke:var(--cyan);stroke-dasharray:8 6;animation:dash .7s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-14}}
+.chamber{fill:#0d1a2b;stroke:#2b4a3a;stroke-width:2}
+.chamber.warn{stroke:var(--warn);fill:#241d0c}
+.chamber.crit{stroke:var(--crit);fill:#2a1214;animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{stroke-opacity:.35}}
+.zt{fill:#e5e7eb;font-size:14px;font-weight:700}
+.zs{font-size:11px;font-weight:700;fill:var(--ok)}
+.zs.warn{fill:var(--warn)} .zs.crit{fill:var(--crit)}
+.rv{font-size:14px;font-weight:700;fill:var(--txt)} .rv.warn{fill:var(--warn)} .rv.crit{fill:var(--crit)}
+.vent{stroke:var(--warn);stroke-width:3;stroke-dasharray:5 5;animation:dash .5s linear infinite}
+/* ---------- tables ---------- */
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);padding:4px 6px;white-space:nowrap}
+td{padding:4px 6px;border-bottom:1px solid #151f31;white-space:nowrap}
+td.n{text-align:right}
+.st-OK{color:var(--ok)} .st-H,.st-L{color:var(--warn)} .st-HH,.st-LL{color:var(--crit);font-weight:700}
+.scroll{overflow:auto;max-height:290px}
+.unack{animation:blink 1s step-start infinite}
+@keyframes blink{50%{opacity:.25}}
+tr.a-crit td{background:#2a1214} tr.a-warn td{background:#231b0a}
+canvas#trend{width:100%;height:270px;display:block;background:var(--panel2);border-radius:6px}
+.legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;font:12px var(--mono)}
+.legend span{padding:2px 8px;border-radius:10px;border:1px solid var(--line)}
+#log{font:12px var(--mono);color:#b7c3d8;max-height:170px;overflow:auto;margin:0;padding:0;list-style:none}
+#log li{padding:2px 0;border-bottom:1px solid #131d2e}
+#log .c{color:var(--crit)} #log .w{color:var(--warn)} #log .g{color:var(--ok)} #log .i{color:var(--cyan)}
+footer{color:var(--dim);font-size:11px;padding:0 16px 16px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 12px}
+.kpi .k{font:11px var(--mono);color:var(--dim);letter-spacing:.08em}
+.kpi .v{font:700 22px var(--mono);margin-top:2px}
+.kpi .s{font:11px var(--mono);color:var(--dim)}
+.kpi.good .v{color:var(--ok)}
+.spin{animation:spin 1s linear infinite;transform-box:fill-box;transform-origin:center}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (max-width:1000px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>HIMADRI · PROCESS STATION<small>Bio-Aware Thermal Cold Storage · SIH26005 · DAQ: ESP32-S3</small></h1>
+  <span class="chip"><span class="dot" id="commDot"></span><span id="commTxt">DAQ ONLINE</span></span>
+  <span class="chip" id="srcChip">SIMULATION</span>
+  <span class="chip" id="modeChip">MODE --</span>
+  <span class="chip">SCAN 1.0 s</span>
+  <span class="spacer"></span>
+  <span class="chip cnt-crit">CRIT <b id="cCrit">0</b></span>
+  <span class="chip cnt-warn">WARN <b id="cWarn">0</b></span>
+  <span class="chip">UNACK <b id="cUn">0</b></span>
+  <span class="chip" id="clock">--:--:--</span>
+</header>
+
+<main>
+  <!-- ============ FAN ENERGY KPIs ============ -->
+  <section class="card full">
+    <h2>Fan energy optimisation
+      <span class="r"><button id="btnDry" title="Simulation only">Dry air: OFF</button></span>
+    </h2>
+    <div class="kpis">
+      <div class="kpi"><div class="k">FAN POWER NOW (JT-301)</div><div class="v" id="kPow">--</div><div class="s" id="kPowS">vs -- W fixed 100 %</div></div>
+      <div class="kpi"><div class="k">ENERGY USED</div><div class="v" id="kUsed">--</div><div class="s">measured since start</div></div>
+      <div class="kpi"><div class="k">FIXED-100 % BASELINE</div><div class="v" id="kBase">--</div><div class="s">same period, fans always full</div></div>
+      <div class="kpi good"><div class="k">ENERGY SAVED</div><div class="v" id="kSave">--</div><div class="s" id="kSaveS">--</div></div>
+    </div>
+  </section>
+
+  <!-- ============ PROCESS MIMIC ============ -->
+  <section class="card">
+    <h2>Process mimic
+      <span class="r">
+        <button id="btnRot" class="on" title="Simulation only">Rot in Zone C: ON</button>
+        <button id="btnReset">Reset sim</button>
+      </span>
+    </h2>
+    <svg id="mimic" viewBox="0 0 960 470" role="img" aria-label="Process mimic diagram"></svg>
+  </section>
+
+  <!-- ============ ALARM SUMMARY ============ -->
+  <section class="card">
+    <h2>Alarm summary <span class="r"><button id="btnAckAll">ACK ALL</button></span></h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Tag</th><th>Description</th><th>Lvl</th><th class="n">Value</th><th>State</th><th></th></tr></thead>
+        <tbody id="almBody"></tbody>
+      </table>
+    </div>
+    <h2 style="margin-top:12px">Event log</h2>
+    <ul id="log"></ul>
+  </section>
+
+  <!-- ============ TREND ============ -->
+  <section class="card">
+    <h2>Trend · last 5 min
+      <span class="r">
+        <button class="tab sel" data-k="co2">CO₂</button>
+        <button class="tab" data-k="temp">TEMP</button>
+        <button class="tab" data-k="rh">RH</button>
+        <button class="tab" data-k="fan">FAN %</button>
+        <button id="btnFreeze">FREEZE</button>
+      </span>
+    </h2>
+    <canvas id="trend"></canvas>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <!-- ============ INSTRUMENT LIST ============ -->
+  <section class="card">
+    <h2>Instrument tag list (scaled DAQ channels)</h2>
+    <div class="scroll" style="max-height:330px">
+      <table>
+        <thead><tr><th>Tag</th><th>Description</th><th class="n">PV</th><th>Unit</th><th class="n">mA</th><th>LL</th><th>L</th><th>H</th><th>HH</th><th>State</th></tr></thead>
+        <tbody id="tagBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Tag naming follows ISA-5.1 (TT temperature, MT moisture/RH, AT analyzer, EI voltage indication, XV damper).
+  mA column = 4–20 mA equivalent of the scaled channel (4 mA = range low, 20 mA = range high).
+  Safety logic mirrors the ESP32 firmware: open damper at CO₂ &gt; 1000 ppm or T &gt; 8 °C, close below 900 ppm and 7 °C.
+  Fan tags: SC = speed command (PWM %), ST = speed feedback (tach RPM), JT = total fan power. Fan fault = commanded &gt; 30 % but RPM &lt; 200.
+</footer>
+
+<script>
+"use strict";
+/* ==========================================================================
+   1. CONFIGURATION - instrument database (one row per DAQ channel)
+   ========================================================================== */
+const ZONES = ['A','B','C','D'];
+const PEN   = {A:'#38bdf8', B:'#22c55e', C:'#f59e0b', D:'#a78bfa'};   // trend pen colours
+const DAY_LEN = 300;          // simulated day length in seconds (compressed for demo)
+const HIST_N  = 300;          // samples kept per tag (1 s scan -> 5 min)
+const SMS_COOLDOWN = 120;     // s (firmware uses 10 min; shortened so it can be shown)
+
+// al = alarm limits in engineering units, db = deadband (prevents alarm chatter)
+const TAGS = [];
+ZONES.forEach((z,i)=>{
+  const n = i+1;
+  TAGS.push({tag:`TT-20${n}`, desc:`Zone ${z} temperature`, unit:'°C',  lo:-10, hi:30,   dec:1, z, kind:'temp', al:{LL:0,L:2,H:8,HH:10}, db:0.5});
+  TAGS.push({tag:`MT-20${n}`, desc:`Zone ${z} rel. humidity`, unit:'%RH', lo:0,   hi:100,  dec:0, z, kind:'rh',   al:{L:75,H:96},        db:2});
+  TAGS.push({tag:`AT-20${n}`, desc:`Zone ${z} CO₂ (NDIR)`,   unit:'ppm', lo:400, hi:2000, dec:0, z, kind:'co2',  al:{H:800,HH:1000},    db:100});
+  TAGS.push({tag:`SC-30${n}`, desc:`Zone ${z} fan speed cmd (PWM)`, unit:'%',  lo:0, hi:100,  dec:0, z, kind:'fan', al:{}, db:0});
+  TAGS.push({tag:`ST-30${n}`, desc:`Zone ${z} fan speed (tach)`,    unit:'rpm',lo:0, hi:3000, dec:0, z, kind:'rpm', al:{LL:200}, db:100});
+});
+TAGS.push({tag:'JT-301', desc:'Total fan power (INA219)', unit:'W', lo:0, hi:12, dec:2, kind:'pwr', al:{}, db:0});
+TAGS.push({tag:'TT-101', desc:'Glycol PCM wall temp', unit:'°C', lo:-10, hi:30, dec:1, kind:'pcm', al:{H:6}, db:0.5});
+TAGS.push({tag:'EI-101', desc:'Solar PV voltage',     unit:'V',  lo:0,   hi:24, dec:1, kind:'pv',  al:{},    db:0});
+
+const SEV = {OK:0, L:1, H:1, LL:2, HH:2};
+
+// Fan control parameters (identical to firmware/main.cpp)
+const FAN = {SP:6.0, DEADBAND:0.3, KP:25, KI:1.5, BIAS:30, INT_MIN:-20, INT_MAX:40,
+             MIN:25, MAX_DAY:100, MAX_NIGHT:50, SLEW:10, RH_DRY:85, RH_WET:95,
+             RATED_W:2.4, MAX_RPM:3000};
+
+/* ==========================================================================
+   2. PROCESS STATE
+   ========================================================================== */
+const V    = {};   // latest process values by tag
+const LV   = {};   // latest alarm level by tag (OK/L/H/LL/HH)
+const HIST = {};   // rolling history by tag
+TAGS.forEach(t=>{ HIST[t.tag]=[]; V[t.tag]=null; LV[t.tag]='OK'; });
+
+const P = {                 // discrete / derived process data
+  t:0, day:true, comp:false, pcm:3.0, rot:0,
+  damper:{A:false,B:false,C:false,D:false},
+  cause:{A:'',B:'',C:'',D:''},
+  rotOn:true, frozen:false, comm:true, lastSms:{},
+  // fan control state (per zone) + simulated thermal plant + energy accounting
+  fan:{A:FAN.MIN,B:FAN.MIN,C:FAN.MIN,D:FAN.MIN}, integ:{A:0,B:0,C:0,D:0}, simT:{A:6,B:6,C:6,D:6},
+  dry:false, powerW:0, energyWh:0, baseWh:0
+};
+const API = new URLSearchParams(location.search).get('api');
+
+/* ==========================================================================
+   3. PROCESS SIMULATOR  (replaces the ESP32 when no ?api= is given)
+   ========================================================================== */
+const rnd = (a,b)=>a+Math.random()*(b-a);
+
+function simulate(){
+  P.t++;
+  const phase = (P.t % DAY_LEN) / DAY_LEN;
+
+  // Solar array: sine-shaped daylight for the first half of the cycle, dark after
+  const pv = phase < 0.5 ? 1 + 21*Math.sin(2*Math.PI*phase) : 0.3 + rnd(0,0.2);
+  V['EI-101'] = pv;
+  P.day = pv > 12;                                   // same rule as firmware (> 12 V)
+
+  // Compressor runs only in daylight and only until the glycol wall is frozen (<= -2 C)
+  P.comp = P.day && P.pcm > -2;
+  P.pcm += P.comp ? -0.06 : +0.012;                  // charge (freeze) vs. slow melt
+  P.pcm = Math.max(-4, Math.min(8, P.pcm));
+  V['TT-101'] = P.pcm;
+
+  // Rotting produce in Zone C: CO2 rises until the damper flushes it out
+  if (P.rotOn && P.t > 30) P.rot = Math.max(0, Math.min(1400, P.rot + (P.damper.C ? -14 : 8)));
+  else if (!P.rotOn)       P.rot = Math.max(0, P.rot - 40);
+
+  ZONES.forEach((z,i)=>{
+    const n=i+1, rot = z==='C' ? P.rot : 0;
+
+    // First-order thermal plant: heat leaks in from 12 C ambient; air moved by the fan over the
+    // cold glycol wall removes it. More fan = more cooling (and cubic more power).
+    const fan0 = P.fan[z];
+    P.simT[z] += 0.010*(12 - P.simT[z]) - 0.021*(fan0/100)*(P.simT[z] - P.pcm)
+               + (z==='C' && P.rotOn && P.t>60 ? 0.02 : 0);
+    const temp = P.simT[z] + rnd(-.08,.08);
+    const rh   = 90 - 0.03*fan0 - (P.dry ? 9 : 0) + rnd(-1,1);      // faster air dries slightly
+    const co2  = 600 + 40*i + rnd(-15,15) + rot;
+    V[`TT-20${n}`]=temp; V[`MT-20${n}`]=rh; V[`AT-20${n}`]=co2;
+
+    // Bio-aware damper logic (latched with hysteresis) - identical to firmware
+    const bad   = co2 > 1000 || temp > 8;
+    const clear = co2 < 900  && temp < 7;
+    if (bad && !P.damper[z]) P.cause[z] = co2 > 1000 ? 'ROT' : 'WARM';
+    P.damper[z] = bad || (P.damper[z] && !clear);
+
+    // Energy-optimised fan speed (PI + humidity trim + limits)
+    const fan = fanController(z, temp, rh, P.day, P.damper[z], 1.0);
+    P.fan[z] = fan;
+    V[`SC-30${n}`] = fan;
+    V[`ST-30${n}`] = fan > 1 ? FAN.MAX_RPM*fan/100*(1+rnd(-.015,.015)) : 0;
+  });
+
+  // Fan power ~ speed^3 (affinity law); baseline = all fans at 100 % all the time
+  let pw = 0; ZONES.forEach(z=>{ const s=P.fan[z]/100; pw += FAN.RATED_W*s*s*s; });
+  P.powerW = pw; V['JT-301'] = pw;
+  P.energyWh += pw/3600;  P.baseWh += ZONES.length*FAN.RATED_W/3600;
+}
+
+/* Same algorithm as fanController() in the ESP32 firmware */
+function fanController(z, temp, rh, day, ventOverride, dt){
+  if (ventOverride) return 100;                        // rot / warm alarm: flush at full speed
+  let err = temp - FAN.SP;
+  if (Math.abs(err) < FAN.DEADBAND) err = 0;
+  P.integ[z] = Math.max(FAN.INT_MIN, Math.min(FAN.INT_MAX, P.integ[z] + err*dt));   // anti-windup
+  let target = FAN.BIAS + FAN.KP*err + FAN.KI*P.integ[z];
+  if (rh < FAN.RH_DRY) target *= 0.7; else if (rh > FAN.RH_WET) target += 15;        // humidity trim
+  target = Math.max(FAN.MIN, Math.min(day ? FAN.MAX_DAY : FAN.MAX_NIGHT, target));
+  const step = FAN.SLEW*dt;                                                           // slew limit
+  return P.fan[z] + Math.max(-step, Math.min(step, target - P.fan[z]));
+}
+
+/* Live mode: read the ESP32's JSON once per scan */
+async function acquireLive(){
+  try{
+    const r = await fetch(API, {cache:'no-store'});
+    const j = await r.json();
+    Object.assign(V, j.values||{});
+    if (j.dampers) Object.assign(P.damper, j.dampers);
+    P.comp = !!j.comp;
+    P.day  = (V['EI-101']||0) > 12;
+    P.pcm  = V['TT-101'];
+    ZONES.forEach((z,i)=>{ if (V[`SC-30${i+1}`]!=null) P.fan[z]=V[`SC-30${i+1}`]; });
+    if (j.energyWh!=null)   P.energyWh = j.energyWh;
+    if (j.baselineWh!=null) P.baseWh   = j.baselineWh;
+    P.powerW = V['JT-301'] || 0;
+    ZONES.forEach((z,i)=>{ if (P.damper[z]) P.cause[z] = (V[`AT-20${i+1}`]>900)?'ROT':'WARM'; });
+    P.comm = true;
+  }catch(e){ P.comm = false; }
+}
+
+/* ==========================================================================
+   4. ALARM ENGINE  (ISA-18.2 style: ACTIVE-UNACK -> ACTIVE-ACK -> RTN)
+   ========================================================================== */
+const ALARMS = [];
+let seq = 0;
+const clock = ()=> new Date().toLocaleTimeString('en-GB');
+
+function level(t, v, prev){
+  const a=t.al, d=t.db;
+  if (a.HH!=null && (v>=a.HH || (prev==='HH' && v>a.HH-d))) return 'HH';
+  if (a.H !=null && (v>=a.H  || ((prev==='H'||prev==='HH') && v>a.H-d))) return 'H';
+  if (a.LL!=null && (v<=a.LL || (prev==='LL' && v<a.LL+d))) return 'LL';
+  if (a.L !=null && (v<=a.L  || ((prev==='L'||prev==='LL') && v<a.L+d))) return 'L';
+  return 'OK';
+}
+
+function log(msg, cls='i'){
+  const li=document.createElement('li');
+  li.innerHTML=`<span style="color:#7b8aa3">${clock()}</span> <span class="${cls}">${msg}</span>`;
+  const ul=document.getElementById('log'); ul.prepend(li);
+  while(ul.children.length>60) ul.lastChild.remove();
+}
+
+function onNewAlarm(a, t){
+  if (t.kind==='rpm' && a.level==='LL') log(`SMS → farmer: Zone ${t.z} FAN FAULT (no tach)`, 'w');
+  // GSM telemetry: rot (CO2 high-high) or temperature high raises an SMS (rate limited per zone)
+  if (t.z && ((t.kind==='co2' && a.level==='HH') || (t.kind==='temp' && (a.level==='H'||a.level==='HH')))){
+    const last = P.lastSms[t.z];
+    if (last==null || P.t-last > SMS_COOLDOWN){
+      P.lastSms[t.z] = P.t;
+      log(`SMS → farmer: Zone ${t.z} ${t.kind==='co2'?'ROT DETECTED':'TEMP HIGH'}, damper opened`, 'w');
+    }
+  }
+}
+
+function processAlarms(){
+  TAGS.forEach(t=>{
+    let v=V[t.tag]; if (v==null) return;
+    // Fan fault: tach alarm is only meaningful while the fan is commanded above 30 %
+    if (t.kind==='rpm' && (V['SC-30'+t.tag.slice(-1)]||0) < 30) v = t.hi/2;
+    const prev=LV[t.tag]; const lv=level(t,v,prev); LV[t.tag]=lv;
+    const a=ALARMS.find(x=>x.tag===t.tag);
+    if (lv!=='OK'){
+      if (!a){
+        const n={id:++seq,time:clock(),tag:t.tag,desc:t.desc,unit:t.unit,dec:t.dec,level:lv,value:v,acked:false,rtn:false};
+        ALARMS.push(n); log(`ALARM ${t.tag} ${lv} = ${v.toFixed(t.dec)} ${t.unit}`, SEV[lv]>1?'c':'w'); onNewAlarm(n,t);
+      } else {
+        if (a.rtn){ a.rtn=false; a.acked=false; a.level=lv; }
+        else if (SEV[lv]>SEV[a.level]){ a.acked=false; a.level=lv; log(`ESCALATED ${t.tag} → ${lv}`,'c'); onNewAlarm(a,t); }
+        else a.level=lv;
+        a.value=v;
+      }
+    } else if (a && !a.rtn){
+      a.rtn=true; log(`RETURN TO NORMAL ${t.tag}`,'g');
+      if (a.acked) ALARMS.splice(ALARMS.indexOf(a),1);
+    }
+  });
+}
+function ack(id){
+  const i=ALARMS.findIndex(a=>a.id===id); if(i<0) return;
+  ALARMS[i].acked=true; if (ALARMS[i].rtn) ALARMS.splice(i,1);
+  renderAlarms();
+}
+function ackAll(){ for (let i=ALARMS.length-1;i>=0;i--){ ALARMS[i].acked=true; if(ALARMS[i].rtn) ALARMS.splice(i,1);} log('All alarms acknowledged'); renderAlarms(); }
+
+/* ==========================================================================
+   5. MIMIC (SVG process diagram)
+   ========================================================================== */
+function buildMimic(){
+  let s = `<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,8 L4,0 L8,8 z" fill="#f59e0b"/></marker></defs>`;
+  // Solar array
+  s += `<rect x="20" y="20" width="130" height="80" rx="4" fill="#0d1a2e" stroke="#3b82f6" stroke-width="2"/>`;
+  for(let i=1;i<4;i++) s+=`<line x1="${20+i*32.5}" y1="20" x2="${20+i*32.5}" y2="100" stroke="#1e3a6b"/>`;
+  s += `<line x1="20" y1="60" x2="150" y2="60" stroke="#1e3a6b"/>
+        <text x="85" y="14" class="lbl" text-anchor="middle">PV-101 SOLAR ARRAY</text>
+        <text id="m_pv" x="85" y="86" class="val" text-anchor="middle">--</text>`;
+  // Compressor
+  s += `<path id="pPvCmp" class="pipe" d="M150,60 H230"/>
+        <rect x="230" y="25" width="140" height="70" rx="6" fill="#0d1a2e" stroke="#3a4d70" stroke-width="2" id="cmpBox"/>
+        <text x="300" y="20" class="lbl" text-anchor="middle">CMP-101 COMPRESSOR</text>
+        <text id="m_cmp" x="300" y="66" class="big" text-anchor="middle">STOP</text>`;
+  // Mode / freeze status text (right of compressor)
+  s += `<text x="430" y="40" class="lbl">OPERATING MODE</text><text id="m_mode" x="430" y="66" class="big">--</text>
+        <text x="700" y="40" class="lbl">THERMAL BATTERY (TT-101)</text><text id="m_freeze" x="700" y="66" class="big">--</text>`;
+  // Pipe compressor -> PCM
+  s += `<path id="pCmpPcm" class="pipe" d="M300,95 V125"/>`;
+  // PCM wall bar
+  s += `<text x="40" y="118" class="lbl">GLYCOL PCM WALL PANELS</text>
+        <rect x="40" y="125" width="880" height="32" rx="4" fill="#0b1524" stroke="#3a4d70"/>
+        <rect id="pcmFill" x="40" y="125" width="0" height="32" rx="4" fill="#38bdf8" opacity=".85"/>
+        <text id="m_pcm" x="480" y="146" text-anchor="middle" class="val">--</text>`;
+  // Zones
+  ZONES.forEach((z,i)=>{
+    const n=i+1, x=40+i*225, cx=x+102;
+    s += `<line x1="${cx}" y1="260" x2="${cx}" y2="217" class="pipe"/>
+      <rect x="${cx-26}" y="193" width="52" height="24" rx="3" fill="#0d1a2e" stroke="#3a4d70" stroke-width="2"/>
+      <line id="bl${z}" x1="${cx-18}" y1="205" x2="${cx+18}" y2="205" stroke="#94a3b8" stroke-width="4" style="transform-origin:${cx}px 205px;transition:transform .6s"/>
+      <text x="${cx+34}" y="203" class="lbl">XV-20${n}</text>
+      <text id="dst${z}" x="${cx+34}" y="217" class="lbl">CLOSED</text>
+      <path id="vt${z}" class="vent" d="M${cx},190 L${cx},166" marker-end="url(#ar)" style="display:none"/>
+      <rect id="ch${z}" x="${x}" y="260" width="205" height="190" rx="6" class="chamber"/>
+      <text x="${x+12}" y="284" class="zt">ZONE ${z}</text>
+      <text id="zs${z}" x="${x+193}" y="284" text-anchor="end" class="zs">NORMAL</text>
+      <text x="${x+12}" y="312" class="lbl">TT-20${n}</text><text id="v_TT-20${n}" x="${x+193}" y="312" text-anchor="end" class="rv">--</text>
+      <text x="${x+12}" y="338" class="lbl">MT-20${n}</text><text id="v_MT-20${n}" x="${x+193}" y="338" text-anchor="end" class="rv">--</text>
+      <text x="${x+12}" y="364" class="lbl">AT-20${n}</text><text id="v_AT-20${n}" x="${x+193}" y="364" text-anchor="end" class="rv">--</text>
+      <line x1="${x+10}" y1="374" x2="${x+195}" y2="374" stroke="#1f2d45"/>
+      <g transform="translate(${x+22},396)"><g id="fb${z}" class="spin" style="animation-play-state:paused" fill="#38bdf8">
+        <ellipse cx="0" cy="-6" rx="3.2" ry="6"/><ellipse cx="0" cy="-6" rx="3.2" ry="6" transform="rotate(120)"/><ellipse cx="0" cy="-6" rx="3.2" ry="6" transform="rotate(240)"/></g>
+        <circle r="2.5" fill="#0d1a2e"/></g>
+      <text x="${x+40}" y="392" class="lbl">SC-30${n}</text><text id="fv${z}" x="${x+193}" y="392" text-anchor="end" class="rv">--</text>
+      <text x="${x+40}" y="410" class="lbl">ST-30${n}</text><text id="fr${z}" x="${x+193}" y="410" text-anchor="end" class="lbl">--</text>
+      <text id="zmsg${z}" x="${x+102}" y="438" text-anchor="middle" class="lbl"></text>`;
+  });
+  document.getElementById('mimic').innerHTML = s;
+}
+const $ = id => document.getElementById(id);
+const fmt = (t,v)=> v==null||isNaN(v) ? '--' : v.toFixed(t.dec);
+const tagBy = Object.fromEntries(TAGS.map(t=>[t.tag,t]));
+
+function freezePct(){ return Math.max(0, Math.min(100, (6 - P.pcm)/8*100)); }   // 6 C=0 %, -2 C=100 %
+
+function updateMimic(){
+  $('m_pv').textContent = fmt(tagBy['EI-101'], V['EI-101']) + ' V';
+  $('m_cmp').textContent = P.comp ? 'RUN' : 'STOP';
+  $('m_cmp').style.fill = P.comp ? 'var(--ok)' : 'var(--dim)';
+  $('cmpBox').style.stroke = P.comp ? 'var(--ok)' : '#3a4d70';
+  $('pPvCmp').setAttribute('class','pipe'+(P.day?' flow':''));
+  $('pCmpPcm').setAttribute('class','pipe'+(P.comp?' flow':''));
+  $('m_mode').textContent = P.day ? (P.comp ? '☀ DAY · CHARGING PCM' : '☀ DAY · PCM FULL') : '🌙 NIGHT · PASSIVE COOLING';
+  const fp = freezePct();
+  $('m_freeze').textContent = fp.toFixed(0) + ' % FROZEN';
+  $('pcmFill').setAttribute('width', 880*fp/100);
+  $('m_pcm').textContent = `TT-101  ${fmt(tagBy['TT-101'],V['TT-101'])} °C`;
+
+  ZONES.forEach((z,i)=>{
+    const n=i+1;
+    let worst=0;
+    ['TT','MT','AT'].forEach(k=>{
+      const tg=`${k}-20${n}`, lv=LV[tg], el=$('v_'+tg);
+      el.textContent = fmt(tagBy[tg], V[tg]) + (k==='TT'?' °C':k==='MT'?' %':' ppm');
+      el.setAttribute('class','rv '+(SEV[lv]>1?'crit':SEV[lv]?'warn':''));
+      worst=Math.max(worst,SEV[lv]);
+    });
+    const open = P.damper[z];
+    const cls = open || worst>1 ? 'crit' : worst ? 'warn' : '';
+    $('ch'+z).setAttribute('class','chamber '+cls);
+    const zs=$('zs'+z);
+    zs.setAttribute('class','zs '+cls);
+    zs.textContent = open ? (P.cause[z]==='ROT' ? 'ROT WARNING!' : 'TEMP HIGH') : worst ? 'ALARM' : 'NORMAL';
+    $('zmsg'+z).textContent = open ? 'DAMPER OPEN · VENTING' : '';
+    $('zmsg'+z).style.fill = open ? 'var(--crit)' : 'var(--dim)';
+    $('dst'+z).textContent = open ? 'OPEN' : 'CLOSED';
+    $('dst'+z).style.fill = open ? 'var(--warn)' : 'var(--dim)';
+    $('bl'+z).style.transform = open ? 'rotate(90deg)' : 'rotate(0deg)';
+    $('vt'+z).style.display = open ? '' : 'none';
+    // fan: speed %, tach rpm, blade animation speed follows the command
+    const sc=V[`SC-30${n}`], st=V[`ST-30${n}`];
+    $('fv'+z).textContent = sc==null ? '--' : sc.toFixed(0)+' %';
+    $('fr'+z).textContent = st==null ? '--' : st.toFixed(0)+' rpm';
+    const fb=$('fb'+z);
+    if (sc>1){ fb.style.animationDuration=(2.4-2.0*sc/100).toFixed(2)+'s'; fb.style.animationPlayState='running'; }
+    else fb.style.animationPlayState='paused';
+    const failed = LV[`ST-30${n}`]==='LL';
+    $('fr'+z).style.fill = failed ? 'var(--crit)' : 'var(--dim)';
+    if (failed) $('fr'+z).textContent += '  FAN FAULT';
+  });
+}
+
+/* ==========================================================================
+   6. TAG LIST, ALARM SUMMARY, HEADER
+   ========================================================================== */
+function mA(t,v){ if(v==null) return null; return Math.max(3.6, Math.min(21, 4 + 16*(v-t.lo)/(t.hi-t.lo))); }
+
+function renderTags(){
+  $('tagBody').innerHTML = TAGS.map(t=>{
+    const v=V[t.tag], lv=LV[t.tag], a=t.al, f=x=>x==null?'':x;
+    return `<tr><td>${t.tag}</td><td>${t.desc}</td><td class="n st-${lv}">${fmt(t,v)}</td><td>${t.unit}</td>
+      <td class="n">${v==null?'--':mA(t,v).toFixed(2)}</td><td>${f(a.LL)}</td><td>${f(a.L)}</td><td>${f(a.H)}</td><td>${f(a.HH)}</td>
+      <td class="st-${lv}">${lv==='OK'?'NORMAL':lv}</td></tr>`;
+  }).join('');
+  // discrete signals
+  $('tagBody').innerHTML += ZONES.map((z,i)=>`<tr><td>XV-20${i+1}</td><td>Zone ${z} damper position</td><td class="n ${P.damper[z]?'st-H':'st-OK'}">${P.damper[z]?'OPEN':'CLOSED'}</td><td>DI</td><td class="n">--</td><td colspan="4"></td><td>${P.damper[z]?'VENTING':'—'}</td></tr>`).join('')
+    + `<tr><td>CMP-101</td><td>Compressor relay</td><td class="n ${P.comp?'st-OK':''}">${P.comp?'RUN':'STOP'}</td><td>DO</td><td class="n">--</td><td colspan="4"></td><td>—</td></tr>`;
+}
+
+function renderAlarms(){
+  const rows = [...ALARMS].sort((a,b)=>SEV[b.level]-SEV[a.level] || b.id-a.id);
+  $('almBody').innerHTML = rows.length ? rows.map(a=>{
+    const st = a.rtn ? 'RTN-UNACK' : a.acked ? 'ACTIVE-ACK' : 'ACTIVE-UNACK';
+    const blink = (!a.acked) ? ' unack' : '';
+    return `<tr class="${SEV[a.level]>1?'a-crit':'a-warn'}"><td>${a.time}</td><td>${a.tag}</td><td>${a.desc}</td>
+      <td class="st-${a.level}">${a.level}</td><td class="n">${a.value.toFixed(a.dec)} ${a.unit}</td>
+      <td class="${blink}">${st}</td><td>${a.acked?'':`<button onclick="ack(${a.id})">ACK</button>`}</td></tr>`;
+  }).join('') : `<tr><td colspan="7" style="color:var(--ok)">No active alarms</td></tr>`;
+
+  const active = ALARMS.filter(a=>!a.rtn);
+  $('cCrit').textContent = active.filter(a=>SEV[a.level]>1).length;
+  $('cWarn').textContent = active.filter(a=>SEV[a.level]===1).length;
+  $('cUn').textContent   = ALARMS.filter(a=>!a.acked).length;
+}
+
+function renderKpis(){
+  const base = ZONES.length*FAN.RATED_W;
+  $('kPow').textContent  = P.powerW.toFixed(2)+' W';
+  $('kPowS').textContent = `vs ${base.toFixed(1)} W fixed 100 %`;
+  $('kUsed').textContent = P.energyWh.toFixed(3)+' Wh';
+  $('kBase').textContent = P.baseWh.toFixed(3)+' Wh';
+  const sv = P.baseWh>0 ? 100*(1-P.energyWh/P.baseWh) : 0;
+  $('kSave').textContent = sv.toFixed(0)+' %';
+  $('kSaveS').textContent = (P.baseWh-P.energyWh).toFixed(3)+' Wh not spent → more cold kept in PCM';
+}
+
+function renderHeader(){
+  $('clock').textContent = clock();
+  $('modeChip').textContent = 'MODE ' + (P.day ? 'DAY' : 'NIGHT');
+  $('commTxt').textContent = P.comm ? 'DAQ ONLINE' : 'DAQ COMM FAIL';
+  $('commDot').className = 'dot' + (P.comm ? '' : ' bad');
+  $('srcChip').textContent = API ? 'LIVE · ' + API.replace(/^https?:\/\//,'') : 'SIMULATION';
+}
+
+/* ==========================================================================
+   7. TREND (canvas historian view)
+   ========================================================================== */
+const TR = { co2:{min:400,max:1400,u:'ppm'}, temp:{min:0,max:12,u:'°C'}, rh:{min:70,max:100,u:'%RH'}, fan:{min:0,max:100,u:'%'} };
+let trendKind='co2', frozen=false, frozenSnap=null;
+
+function drawTrend(){
+  const cv=$('trend'), dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth, h=cv.clientHeight;
+  if (cv.width!==Math.round(w*dpr)){ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr); }
+  const c=cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  const R=TR[trendKind], L=46, Rt=10, T=10, B=24, pw=w-L-Rt, ph=h-T-B;
+  const Y=v=>T+ph*(1-(v-R.min)/(R.max-R.min));
+  c.font='11px ui-monospace,Consolas,monospace'; c.strokeStyle='#1c2a42'; c.fillStyle='#7b8aa3'; c.lineWidth=1;
+  for(let i=0;i<=5;i++){ const v=R.min+(R.max-R.min)*i/5, y=Y(v);
+    c.beginPath(); c.moveTo(L,y); c.lineTo(w-Rt,y); c.stroke(); c.fillText(v.toFixed(trendKind==='co2'?0:1),4,y+4); }
+  c.fillText('-300 s',L,h-6); c.fillText('now',w-Rt-24,h-6);
+  // alarm limit lines
+  const ref = TAGS.find(t=>t.kind===trendKind);
+  Object.entries(ref.al).forEach(([k,v])=>{
+    if (v<R.min||v>R.max) return;
+    c.setLineDash([6,4]); c.strokeStyle = (k==='HH'||k==='LL')?'#ef4444':'#f59e0b';
+    c.beginPath(); c.moveTo(L,Y(v)); c.lineTo(w-Rt,Y(v)); c.stroke(); c.setLineDash([]);
+    c.fillStyle=c.strokeStyle; c.fillText(k,w-Rt-22,Y(v)-3);
+  });
+  // pens
+  const src = frozen && frozenSnap ? frozenSnap : HIST;
+  TAGS.filter(t=>t.kind===trendKind).forEach(t=>{
+    const d=src[t.tag]; if(!d.length) return;
+    c.strokeStyle=PEN[t.z]; c.lineWidth=1.8; c.beginPath();
+    d.forEach((v,i)=>{ const x=L+pw*(i+(HIST_N-d.length))/(HIST_N-1), y=Math.max(T,Math.min(T+ph,Y(v)));
+      i?c.lineTo(x,y):c.moveTo(x,y); });
+    c.stroke();
+  });
+  $('legend').innerHTML = TAGS.filter(t=>t.kind===trendKind).map(t=>
+    `<span style="border-color:${PEN[t.z]};color:${PEN[t.z]}">${t.tag} ${fmt(t,V[t.tag])} ${t.unit}</span>`).join('');
+}
+
+/* ==========================================================================
+   8. MAIN SCAN LOOP  (1 s, like a DAQ scan cycle)
+   ========================================================================== */
+async function scan(){
+  if (API) { P.t++; await acquireLive(); } else simulate();
+  if (P.comm && V['EI-101']!=null){
+    TAGS.forEach(t=>{ if (V[t.tag]==null) return; const h=HIST[t.tag]; h.push(V[t.tag]); if(h.length>HIST_N) h.shift(); });
+    processAlarms();
+  }
+  renderHeader(); updateMimic(); renderKpis(); renderTags(); renderAlarms(); drawTrend();
+}
+
+/* ---------- UI wiring ---------- */
+document.querySelectorAll('button.tab').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('button.tab').forEach(x=>x.classList.remove('sel')); b.classList.add('sel');
+  trendKind=b.dataset.k; drawTrend();
+});
+$('btnFreeze').onclick=()=>{ frozen=!frozen; frozenSnap=frozen?JSON.parse(JSON.stringify(HIST)):null;
+  $('btnFreeze').textContent=frozen?'RESUME':'FREEZE'; $('btnFreeze').classList.toggle('on',frozen); drawTrend(); };
+$('btnAckAll').onclick=ackAll;
+$('btnDry').onclick=()=>{ P.dry=!P.dry; $('btnDry').textContent='Dry air: '+(P.dry?'ON':'OFF'); $('btnDry').classList.toggle('on',P.dry);
+  log(P.dry ? 'Dry-air test ON: RH falls below 85 %, fans slow to protect produce' : 'Dry-air test OFF'); };
+$('btnRot').onclick=()=>{ P.rotOn=!P.rotOn; $('btnRot').textContent='Rot in Zone C: '+(P.rotOn?'ON':'OFF'); $('btnRot').classList.toggle('on',P.rotOn); };
+$('btnReset').onclick=()=>{ P.t=0; P.pcm=3; P.rot=0; P.lastSms={}; P.energyWh=0; P.baseWh=0;
+  ZONES.forEach(z=>{P.damper[z]=false; P.fan[z]=FAN.MIN; P.integ[z]=0; P.simT[z]=6;});
+  TAGS.forEach(t=>{HIST[t.tag]=[];LV[t.tag]='OK';}); ALARMS.length=0; log('Simulation reset'); renderAlarms(); };
+if (API) { $('btnRot').style.display='none'; $('btnReset').style.display='none'; $('btnDry').style.display='none'; }
+window.addEventListener('resize', drawTrend);
+
+buildMimic();
+log(API ? 'Live mode: polling ' + API : 'Simulation started. Zone C starts rotting after ~30 s; expect CO₂ alarm ≈ 1 min.');
+scan();
+setInterval(scan, 1000);
+</script>
+</body>
+</html>

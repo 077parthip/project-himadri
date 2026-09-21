@@ -1,0 +1,5 @@
+# Himadri dashboard dependencies
+streamlit>=1.50       # st.fragment(run_every=...) and width="stretch"
+pandas>=2.0
+plotly>=5.20
+paho-mqtt>=2.0         # optional: only used in "Live MQTT" mode (v2 callback API)

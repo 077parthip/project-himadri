@@ -1,0 +1,24 @@
+; Project Himadri - PlatformIO build config
+; "pio run -e simulation"  -> demo build, no sensors needed
+; "pio run -e hardware"    -> real SHT35 / SCD30 / SIM800L drivers
+
+[platformio]
+src_dir = firmware
+
+[env]
+platform  = espressif32
+board     = esp32-s3-devkitc-1
+framework = arduino
+monitor_speed = 115200
+lib_deps  =
+    madhephaestus/ESP32Servo@^3.0.5
+
+[env:simulation]
+build_flags = -DSIMULATE_SENSORS=1
+
+[env:hardware]
+build_flags = -DSIMULATE_SENSORS=0
+lib_deps =
+    ${env.lib_deps}
+    adafruit/Adafruit SHT31 Library@^2.2.2
+    sparkfun/SparkFun SCD30 Arduino Library@^1.0.20
